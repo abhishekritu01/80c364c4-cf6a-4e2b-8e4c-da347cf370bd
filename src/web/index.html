@@ -1,0 +1,265 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Device Savings Viewer</title>
+    <style>
+      body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
+      #chart { width: 100%; height: 60vh; min-height: 380px; margin-top: 12px; background: #fff; border: 1px solid #eee; }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      .stack { display: grid; gap: 12px; }
+      select, input { padding: 6px 8px; }
+      button { padding: 8px 12px; cursor: pointer; }
+      .btn { border: 1px solid #ccc; background: #fafafa; }
+      .btn.primary { background: #2563eb; color: white; border-color: #2563eb; }
+      .btn.ghost { background: white; }
+      .badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #eef2ff; color: #3730a3; }
+      .error { padding: 8px 12px; background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; display: none; }
+      .loading { display: none; font-size: 14px; color: #475569; }
+      .card { border: 1px solid #eee; padding: 10px 12px; border-radius: 8px; background: #fff; min-width: 160px; flex: 1 1 160px; }
+      .cards { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+      .muted { color: #6b7280; }
+      .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+      /* Responsive tweaks */
+      @media (max-width: 1024px) {
+        body { margin: 14px; }
+        #chart { height: 56vh; }
+      }
+      @media (max-width: 768px) {
+        .bar { flex-direction: column; align-items: stretch; }
+        select, input, button { width: 100%; }
+        #chart { height: 50vh; min-height: 320px; }
+      }
+      @media (max-width: 480px) {
+        h2 { font-size: 18px; }
+        .badge { display: inline-block; margin-top: 6px; }
+        #chart { height: 45vh; min-height: 260px; }
+        .card { min-width: 140px; }
+      }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  </head>
+  <body>
+    <h2>Device Savings <span id="tz" class="badge"></span></h2>
+    <div class="stack">
+      <div class="bar">
+        <label>Device:</label>
+        <select id="device"></select>
+        <span class="muted" id="deviceName"></span>
+      </div>
+      <div class="bar">
+        <label>Start (UTC):</label>
+        <input type="datetime-local" id="startLocal" />
+        <label>End:</label>
+        <input type="datetime-local" id="endLocal" />
+        <button class="btn primary" id="load">Load</button>
+        <span id="loading" class="loading">Loading…</span>
+      </div>
+      <div class="bar">
+        <span class="muted">Quick ranges:</span>
+        <button class="btn ghost" data-range="6h">Last 6h</button>
+        <button class="btn ghost" data-range="12h">Last 12h</button>
+        <button class="btn ghost" data-range="24h">Last 24h</button>
+        <button class="btn ghost" id="today">Today</button>
+        <button class="btn ghost" id="prev">◀ Prev</button>
+        <button class="btn ghost" id="next">Next ▶</button>
+        <button class="btn" id="resetZoom">Reset Zoom</button>
+        <button class="btn" id="exportCsv">Export CSV</button>
+      </div>
+      <div id="error" class="error"></div>
+    </div>
+    <div id="chart"></div>
+    <div class="cards">
+      <div class="card"><div class="muted">Points</div><div id="points">-</div></div>
+      <div class="card"><div class="muted">Total Carbon Saved</div><div id="tCarbon">-</div></div>
+      <div class="card"><div class="muted">Total Fuel Saved</div><div id="tFuel">-</div></div>
+      <div class="card"><div class="muted">Window</div><div id="window">-</div></div>
+    </div>
+
+    <script>
+      async function fetchDevices() {
+        const res = await fetch('/devices');
+        const json = await res.json();
+        return json.devices || [];
+      }
+
+      async function fetchSavings(id, start, end) {
+        const url = new URL(`/devices/${id}/savings`, window.location.origin);
+        url.searchParams.set('start', start);
+        url.searchParams.set('end', end);
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(await res.text());
+        return res.json();
+      }
+
+      (async function init() {
+        const deviceSelect = document.getElementById('device');
+        const deviceName = document.getElementById('deviceName');
+        const tzEl = document.getElementById('tz');
+        const startLocal = document.getElementById('startLocal');
+        const endLocal = document.getElementById('endLocal');
+        const btn = document.getElementById('load');
+        const chartEl = document.getElementById('chart');
+        const errorEl = document.getElementById('error');
+        const loadingEl = document.getElementById('loading');
+        const pointsEl = document.getElementById('points');
+        const tCarbonEl = document.getElementById('tCarbon');
+        const tFuelEl = document.getElementById('tFuel');
+        const windowEl = document.getElementById('window');
+
+        const devices = await fetchDevices();
+        devices.forEach(d => {
+          const opt = document.createElement('option');
+          opt.value = d.id; opt.textContent = `${d.id} - ${d.name}`; opt.dataset.tz = d.timezone;
+          deviceSelect.appendChild(opt);
+        });
+
+        function setDeviceInfo() {
+          const d = devices.find(x => String(x.id) === String(deviceSelect.value));
+          if (d) { deviceName.textContent = d.name; tzEl.textContent = d.timezone; }
+        }
+
+        function toIsoZ(local) {
+          // datetime-local returns like '2023-01-01T00:00'
+          const d = new Date(local);
+          return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString();
+        }
+
+        function fromIsoZ(iso) {
+          const d = new Date(iso);
+          const local = new Date(d.getTime() + d.getTimezoneOffset() * 60000);
+          return local.toISOString().slice(0, 16);
+        }
+
+        // Defaults
+        startLocal.value = '2023-01-01T00:00';
+        endLocal.value = '2023-01-01T23:59';
+        setDeviceInfo();
+
+        const chart = echarts.init(chartEl);
+        chart.setOption({
+          backgroundColor: '#fff',
+          tooltip: {
+            trigger: 'axis',
+            valueFormatter: v => typeof v === 'number' ? v.toFixed(3) : v,
+            axisPointer: { type: 'cross' }
+          },
+          legend: { data: ['carbon_saved', 'fuel_saved'] },
+          xAxis: { type: 'time' },
+          yAxis: [
+            { type: 'value', name: 'Carbon', scale: true },
+            { type: 'value', name: 'Fuel', scale: true }
+          ],
+          dataZoom: [{ type: 'inside' }, { type: 'slider' }],
+          series: [
+            { name: 'carbon_saved', yAxisIndex: 0, type: 'line', showSymbol: false, smooth: true, data: [] },
+            { name: 'fuel_saved', yAxisIndex: 1, type: 'line', showSymbol: false, smooth: true, data: [] },
+          ],
+        });
+
+        function setLoading(v) { loadingEl.style.display = v ? 'inline' : 'none'; }
+        function setError(msg) {
+          errorEl.style.display = msg ? 'block' : 'none';
+          errorEl.textContent = msg || '';
+        }
+
+        function validateRange(sIso, eIso) {
+          const s = new Date(sIso).getTime();
+          const e = new Date(eIso).getTime();
+          if (Number.isNaN(s) || Number.isNaN(e)) return 'Invalid datetime';
+          if (e <= s) return 'End must be after start';
+          if (e - s > 24 * 60 * 60 * 1000) return 'Maximum allowed range is 1 day';
+          return null;
+        }
+
+        async function load() {
+          setError(''); setLoading(true);
+          try {
+            const id = deviceSelect.value;
+            const startIso = toIsoZ(startLocal.value);
+            const endIso = toIsoZ(endLocal.value);
+            const err = validateRange(startIso, endIso);
+            if (err) { setError(err); return; }
+            const res = await fetchSavings(id, startIso, endIso);
+            const carbon = res.data.map(p => [p.timestamp, p.carbon_saved]);
+            const fuel = res.data.map(p => [p.timestamp, p.fuel_saved]);
+            chart.setOption({
+              xAxis: { min: res.start, max: res.end },
+              series: [
+                { name: 'carbon_saved', data: carbon },
+                { name: 'fuel_saved', data: fuel },
+              ]
+            });
+            pointsEl.textContent = res.points;
+            tCarbonEl.textContent = res.summary.total_carbon_saved.toFixed(3);
+            tFuelEl.textContent = res.summary.total_fuel_saved.toFixed(3);
+            windowEl.textContent = `${fromIsoZ(res.start)} → ${fromIsoZ(res.end)}`;
+          } catch (e) {
+            setError(e.message || String(e));
+          } finally {
+            setLoading(false);
+          }
+        }
+
+        // Events
+        btn.addEventListener('click', load);
+        deviceSelect.addEventListener('change', () => { setDeviceInfo(); load(); });
+        document.getElementById('resetZoom').addEventListener('click', () => chart.dispatchAction({ type: 'dataZoom', start: 0, end: 100 }));
+
+        // Quick ranges
+        document.querySelectorAll('[data-range]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const hours = btn.dataset.range === '6h' ? 6 : btn.dataset.range === '12h' ? 12 : 24;
+            const end = new Date('2023-01-01T23:59:59.999Z');
+            const start = new Date(end.getTime() - hours * 3600 * 1000);
+            startLocal.value = fromIsoZ(start.toISOString());
+            endLocal.value = fromIsoZ(end.toISOString());
+            load();
+          });
+        });
+
+        document.getElementById('today').addEventListener('click', () => {
+          // example dataset day
+          startLocal.value = '2023-01-01T00:00';
+          endLocal.value = '2023-01-01T23:59';
+          load();
+        });
+
+        function shiftWindow(ms) {
+          const s = new Date(toIsoZ(startLocal.value)).getTime() + ms;
+          const e = new Date(toIsoZ(endLocal.value)).getTime() + ms;
+          startLocal.value = fromIsoZ(new Date(s).toISOString());
+          endLocal.value = fromIsoZ(new Date(e).toISOString());
+          load();
+        }
+        document.getElementById('prev').addEventListener('click', () => shiftWindow(-24*3600*1000));
+        document.getElementById('next').addEventListener('click', () => shiftWindow(24*3600*1000));
+
+        // CSV export
+        document.getElementById('exportCsv').addEventListener('click', async () => {
+          try {
+            const id = deviceSelect.value;
+            const startIso = toIsoZ(startLocal.value);
+            const endIso = toIsoZ(endLocal.value);
+            const res = await fetchSavings(id, startIso, endIso);
+            const rows = [['timestamp','device_timestamp','carbon_saved','fuel_saved'], ...res.data.map(p => [p.timestamp, p.device_timestamp, p.carbon_saved, p.fuel_saved])];
+            const csv = rows.map(r => r.join(',')).join('\n');
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = `device_${id}_${startIso}_${endIso}.csv`;
+            a.click();
+            URL.revokeObjectURL(a.href);
+          } catch (e) { setError(e.message || String(e)); }
+        });
+
+        await load();
+        window.addEventListener('resize', () => chart.resize());
+      })();
+    </script>
+  </body>
+  </html>
+
+
